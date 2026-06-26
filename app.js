@@ -71,16 +71,32 @@
     },
   };
 
-  let state = loadState();
-  let selectedParticipantId = state.participants[0]?.id || "";
+  const supabaseConfig = window.BOLAO_SUPABASE_CONFIG || {};
+  const hasSupabaseLibrary = Boolean(window.supabase?.createClient);
+  const hasSupabaseConfig = Boolean(supabaseConfig.url && supabaseConfig.anonKey);
+  const onlineMode = Boolean(hasSupabaseLibrary && hasSupabaseConfig);
+  const db = onlineMode ? window.supabase.createClient(supabaseConfig.url, supabaseConfig.anonKey) : null;
+
+  let state = clone(sampleState);
+  let selectedParticipantId = "";
   let toastTimer = null;
+  let remoteReloadTimer = null;
 
   const els = {};
 
-  document.addEventListener("DOMContentLoaded", () => {
+  document.addEventListener("DOMContentLoaded", async () => {
     cacheElements();
     bindEvents();
+    state = await loadState();
+    selectedParticipantId = state.participants[0]?.id || "";
+    setupRealtime();
     renderAll();
+
+    if (onlineMode) {
+      showToast("Banco online conectado");
+    } else if (hasSupabaseConfig && !hasSupabaseLibrary) {
+      showToast("Supabase não carregou; usando modo local");
+    }
   });
 
   function cacheElements() {
@@ -158,7 +174,14 @@
       const participant = state.participants.find((item) => item.id === checkbox.dataset.paidId);
       if (!participant) return;
       participant.paid = checkbox.checked;
-      persist("Pagamento atualizado");
+      persist("Pagamento atualizado", () =>
+        runRemote(
+          db
+            .from("participants")
+            .update({ paid: participant.paid })
+            .eq("id", participant.id),
+        ),
+      );
     });
 
     els.matchesTable.addEventListener("change", (event) => {
@@ -189,7 +212,19 @@
     });
   }
 
-  function loadState() {
+  async function loadState() {
+    if (!onlineMode) return loadLocalState();
+
+    try {
+      return await loadRemoteState();
+    } catch (error) {
+      console.error("Falha ao carregar Supabase; usando modo local.", error);
+      showToast("Falha no banco online; usando modo local");
+      return loadLocalState();
+    }
+  }
+
+  function loadLocalState() {
     const saved = localStorage.getItem(STORAGE_KEY);
     if (!saved) return clone(sampleState);
 
@@ -199,6 +234,51 @@
       console.warn("Dados salvos inválidos; usando exemplo.", error);
       return clone(sampleState);
     }
+  }
+
+  async function loadRemoteState() {
+    const [participantsResult, matchesResult, predictionsResult, settingsResult] = await Promise.all([
+      db.from("participants").select("*").order("name", { ascending: true }),
+      db.from("matches").select("*").order("match_date", { ascending: true }),
+      db.from("predictions").select("*"),
+      db.from("settings").select("*").eq("id", 1).maybeSingle(),
+    ]);
+
+    [
+      participantsResult.error,
+      matchesResult.error,
+      predictionsResult.error,
+      settingsResult.error,
+    ].forEach((error) => {
+      if (error) throw error;
+    });
+
+    const remoteState = {
+      version: 1,
+      settings: settingsResult.data
+        ? {
+            exact: toInteger(settingsResult.data.exact, defaultSettings.exact),
+            outcome: toInteger(settingsResult.data.outcome, defaultSettings.outcome),
+            goal: toInteger(settingsResult.data.goal, defaultSettings.goal),
+          }
+        : { ...defaultSettings },
+      participants: (participantsResult.data || []).map(fromDbParticipant),
+      matches: (matchesResult.data || []).map(fromDbMatch),
+      predictions: {},
+    };
+
+    (predictionsResult.data || []).forEach((row) => {
+      if (!remoteState.predictions[row.participant_id]) {
+        remoteState.predictions[row.participant_id] = {};
+      }
+
+      remoteState.predictions[row.participant_id][row.match_id] = {
+        home: toScoreOrNull(row.home_score),
+        away: toScoreOrNull(row.away_score),
+      };
+    });
+
+    return normalizeState(remoteState);
   }
 
   function normalizeState(value) {
@@ -487,7 +567,10 @@
     state.predictions[participant.id] = {};
     selectedParticipantId = participant.id;
     els.participantForm.reset();
-    persist("Participante adicionado");
+
+    persist("Participante adicionado", () =>
+      runRemote(db.from("participants").insert(toDbParticipant(participant))),
+    );
   }
 
   function deleteParticipant(id) {
@@ -498,7 +581,8 @@
     state.participants = state.participants.filter((item) => item.id !== id);
     delete state.predictions[id];
     selectedParticipantId = state.participants[0]?.id || "";
-    persist("Participante excluído");
+
+    persist("Participante excluído", () => runRemote(db.from("participants").delete().eq("id", id)));
   }
 
   function addMatch() {
@@ -518,7 +602,8 @@
     els.matchHome.value = "";
     els.matchAway.value = "";
     els.matchHome.focus();
-    persist("Jogo adicionado");
+
+    persist("Jogo adicionado", () => runRemote(db.from("matches").insert(toDbMatch(match))));
   }
 
   function deleteMatch(id) {
@@ -530,7 +615,8 @@
     Object.values(state.predictions).forEach((participantPredictions) => {
       delete participantPredictions[id];
     });
-    persist("Jogo excluído");
+
+    persist("Jogo excluído", () => runRemote(db.from("matches").delete().eq("id", id)));
   }
 
   function updateResult(matchId, side, value) {
@@ -538,8 +624,18 @@
     if (!match) return;
 
     match[side === "home" ? "homeScore" : "awayScore"] = toScoreOrNull(value);
-    saveState();
-    renderAll();
+
+    persist(null, () =>
+      runRemote(
+        db
+          .from("matches")
+          .update({
+            home_score: match.homeScore,
+            away_score: match.awayScore,
+          })
+          .eq("id", matchId),
+      ),
+    );
   }
 
   function updatePrediction(matchId, side, value) {
@@ -557,8 +653,30 @@
       state.predictions[selectedParticipantId][matchId] = current;
     }
 
-    saveState();
-    renderAll();
+    persist(null, () => {
+      if (current.home === null && current.away === null) {
+        return runRemote(
+          db
+            .from("predictions")
+            .delete()
+            .eq("participant_id", selectedParticipantId)
+            .eq("match_id", matchId),
+        );
+      }
+
+      return runRemote(
+        db.from("predictions").upsert(
+          {
+            participant_id: selectedParticipantId,
+            match_id: matchId,
+            home_score: current.home,
+            away_score: current.away,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: "participant_id,match_id" },
+        ),
+      );
+    });
   }
 
   function saveSettings() {
@@ -567,7 +685,20 @@
       outcome: toInteger(els.scoreOutcome.value, defaultSettings.outcome),
       goal: toInteger(els.scoreGoal.value, defaultSettings.goal),
     };
-    persist("Pontuação salva");
+
+    persist("Pontuação salva", () =>
+      runRemote(
+        db.from("settings").upsert(
+          {
+            id: 1,
+            exact: state.settings.exact,
+            outcome: state.settings.outcome,
+            goal: state.settings.goal,
+          },
+          { onConflict: "id" },
+        ),
+      ),
+    );
   }
 
   function exportData() {
@@ -588,11 +719,19 @@
     if (!file) return;
 
     const reader = new FileReader();
-    reader.onload = () => {
+    reader.onload = async () => {
       try {
         state = normalizeState(JSON.parse(reader.result));
         selectedParticipantId = state.participants[0]?.id || "";
-        persist("Dados importados");
+        renderAll();
+
+        if (onlineMode) {
+          await replaceRemoteState(state);
+          showToast("Dados importados para o banco online");
+        } else {
+          saveLocalState();
+          showToast("Dados importados");
+        }
       } catch (error) {
         console.error(error);
         showToast("Arquivo inválido");
@@ -607,7 +746,7 @@
     if (!confirm("Restaurar os dados de exemplo?")) return;
     state = clone(sampleState);
     selectedParticipantId = state.participants[0]?.id || "";
-    persist("Exemplo restaurado");
+    persist("Exemplo restaurado", () => replaceRemoteState(state));
   }
 
   function clearData() {
@@ -620,7 +759,7 @@
       predictions: {},
     };
     selectedParticipantId = "";
-    persist("Dados limpos");
+    persist("Dados limpos", () => replaceRemoteState(state));
   }
 
   function computeRanking() {
@@ -678,14 +817,151 @@
     return "draw";
   }
 
-  function persist(message) {
-    saveState();
+  async function persist(message, remoteAction) {
     renderAll();
-    if (message) showToast(message);
+
+    try {
+      if (onlineMode && remoteAction) {
+        await remoteAction();
+      } else {
+        saveLocalState();
+      }
+
+      if (message) showToast(message);
+    } catch (error) {
+      console.error("Falha ao salvar alteração.", error);
+      showToast("Não foi possível salvar no banco online");
+      scheduleRemoteReload();
+    }
   }
 
-  function saveState() {
+  function saveLocalState() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  }
+
+  async function replaceRemoteState(nextState) {
+    await runRemote(db.from("predictions").delete().neq("match_id", "__never__"));
+    await runRemote(db.from("matches").delete().neq("id", "__never__"));
+    await runRemote(db.from("participants").delete().neq("id", "__never__"));
+
+    await runRemote(
+      db.from("settings").upsert(
+        {
+          id: 1,
+          exact: nextState.settings.exact,
+          outcome: nextState.settings.outcome,
+          goal: nextState.settings.goal,
+        },
+        { onConflict: "id" },
+      ),
+    );
+
+    if (nextState.participants.length) {
+      await runRemote(db.from("participants").insert(nextState.participants.map(toDbParticipant)));
+    }
+
+    if (nextState.matches.length) {
+      await runRemote(db.from("matches").insert(nextState.matches.map(toDbMatch)));
+    }
+
+    const predictionRows = [];
+    Object.entries(nextState.predictions).forEach(([participantId, participantPredictions]) => {
+      Object.entries(participantPredictions || {}).forEach(([matchId, prediction]) => {
+        if (!hasCompletePrediction(prediction)) return;
+        predictionRows.push({
+          participant_id: participantId,
+          match_id: matchId,
+          home_score: prediction.home,
+          away_score: prediction.away,
+          updated_at: new Date().toISOString(),
+        });
+      });
+    });
+
+    if (predictionRows.length) {
+      await runRemote(db.from("predictions").insert(predictionRows));
+    }
+  }
+
+  async function runRemote(request) {
+    if (!onlineMode) return;
+    const { error } = await request;
+    if (error) throw error;
+  }
+
+  function setupRealtime() {
+    if (!onlineMode) return;
+
+    db.channel("bolao-copa-updates")
+      .on("postgres_changes", { event: "*", schema: "public", table: "participants" }, scheduleRemoteReload)
+      .on("postgres_changes", { event: "*", schema: "public", table: "matches" }, scheduleRemoteReload)
+      .on("postgres_changes", { event: "*", schema: "public", table: "predictions" }, scheduleRemoteReload)
+      .on("postgres_changes", { event: "*", schema: "public", table: "settings" }, scheduleRemoteReload)
+      .subscribe((status, error) => {
+        if (error) {
+          console.error("Erro no realtime do Supabase.", error);
+        }
+
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          showToast("Atualização em tempo real instável");
+        }
+      });
+  }
+
+  function scheduleRemoteReload() {
+    if (!onlineMode) return;
+
+    clearTimeout(remoteReloadTimer);
+    remoteReloadTimer = setTimeout(async () => {
+      try {
+        state = await loadRemoteState();
+        renderAll();
+      } catch (error) {
+        console.error("Falha ao recarregar dados online.", error);
+      }
+    }, 300);
+  }
+
+  function fromDbParticipant(row) {
+    return {
+      id: String(row.id),
+      name: String(row.name),
+      contact: row.contact ? String(row.contact) : "",
+      paid: Boolean(row.paid),
+    };
+  }
+
+  function toDbParticipant(participant) {
+    return {
+      id: participant.id,
+      name: participant.name,
+      contact: participant.contact || "",
+      paid: Boolean(participant.paid),
+    };
+  }
+
+  function fromDbMatch(row) {
+    return {
+      id: String(row.id),
+      phase: row.phase || "Grupo",
+      date: row.match_date || "",
+      home: row.home,
+      away: row.away,
+      homeScore: toScoreOrNull(row.home_score),
+      awayScore: toScoreOrNull(row.away_score),
+    };
+  }
+
+  function toDbMatch(match) {
+    return {
+      id: match.id,
+      phase: match.phase || "Grupo",
+      match_date: match.date,
+      home: match.home,
+      away: match.away,
+      home_score: match.homeScore,
+      away_score: match.awayScore,
+    };
   }
 
   function ensureSelectedParticipant() {
@@ -819,6 +1095,7 @@
   }
 
   function showToast(message) {
+    if (!els.toast) return;
     clearTimeout(toastTimer);
     els.toast.textContent = message;
     els.toast.classList.add("show");
