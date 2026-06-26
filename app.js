@@ -664,6 +664,12 @@
         );
       }
 
+      if (current.home === null || current.away === null) {
+        // Aguarda os dois campos do palpite serem preenchidos antes de salvar no banco online.
+        // Isso evita erro quando o usuário digita primeiro apenas um lado do placar.
+        return Promise.resolve();
+      }
+
       return runRemote(
         db.from("predictions").upsert(
           {
